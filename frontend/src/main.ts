@@ -69,6 +69,9 @@ interface ServerMessage {
   type?: string;
   event?: string;
   message?: string;
+  /** False on deterministic failures (e.g. auth rejected) — reconnecting
+   *  with the same parameters cannot succeed and must not be attempted. */
+  retryable?: boolean;
   fingerprint?: string;
   expectedFingerprint?: string;
   keyType?: string;
@@ -119,6 +122,9 @@ const MAX_KEY_BYTES = 65_536;
 const MAX_LEGACY_PASSWORD_BASE64_LENGTH = 16_384;
 const PING_INTERVAL_MS = 25_000;
 const CLIENT_CLOSE_SESSION_ERROR = 4000;
+/** Server (Durable Object) closes with 4001 on deterministic SSH failures
+ *  (authentication rejected, host key declined/unverifiable) — never retry. */
+const SERVER_CLOSE_AUTH_DEFECT = 4001;
 const CLIENT_CLOSE_PROTOCOL_ERROR = 4002;
 
 function loadLanguage(): Language {
@@ -1674,6 +1680,17 @@ function handleServerMessage(message: ServerMessage): void {
     event(text, message.event ?? 'error', true);
     showFormError(text);
     toast(text, 'error');
+    if (message.retryable === false) {
+      // Deterministic failure (e.g. wrong password): stop the reconnect
+      // manager before failActiveConnection closes the socket, so no automatic
+      // reconnection is attempted with the same invalid credentials. This is
+      // the primary defense — failActiveConnection closes with 4000, which
+      // masks the server's 4001, so relying on the close code alone would not
+      // suffice. The 4001 close-code filter in the reconnect manager remains
+      // as a backup for cases where the error message never arrives.
+      sshReconnectManager?.reset();
+      sshReconnectManager = null;
+    }
     failActiveConnection(failedSocket, 'SSH session failed', messageTranslation(text));
     return;
   }
@@ -1938,6 +1955,9 @@ async function connect(): Promise<void> {
       id: 'SSH',
       onConnect: createSshReconnectFactory(),
       onLog: handleSshReconnectLog,
+      // Deterministic server failures (bad credentials, declined host key)
+      // arrive as close code 4001 — the manager must not retry them.
+      nonRetryableCloseCodes: [SERVER_CLOSE_AUTH_DEFECT],
     });
     sshReconnectManager.attach(activeSocket);
 
@@ -1983,7 +2003,12 @@ async function connect(): Promise<void> {
       currentExpectedFingerprint = '';
       currentRememberedFingerprint = '';
       const wasActive = connectionState === 'connected';
-      const isUnexpected = closeEvent.code !== 1000 && closeEvent.code !== 1005;
+      // Close code 4001 is the server's deterministic-failure signal (bad
+      // credentials / declined host key). The reconnect manager filters it
+      // out via nonRetryableCloseCodes, so the UI must not claim a
+      // reconnection is in progress either.
+      const isAuthDefect = closeEvent.code === SERVER_CLOSE_AUTH_DEFECT;
+      const isUnexpected = closeEvent.code !== 1000 && closeEvent.code !== 1005 && !isAuthDefect;
 
       if (isUnexpected && sshReconnectManager) {
         // The reconnect manager will attempt reconnection autonomously.
@@ -2010,11 +2035,13 @@ async function connect(): Promise<void> {
       resetNetworkMetric();
       clearHostKeyPrompt();
       invalidateHistoryPasswordLoad();
-      const reason = closeEvent.reason
-        ? bilingualServerMessage(closeEvent.reason)
-        : closeEvent.code === 1000
-          ? bilingual('会话已关闭。', 'Session closed.')
-          : bilingual(`会话已关闭（${closeEvent.code}）。`, `Session closed (${closeEvent.code}).`);
+      const reason = isAuthDefect
+        ? bilingual('SSH 认证失败，请检查用户名与密码/密钥后重试。', 'SSH authentication failed; please check the username and password/key and try again.')
+        : closeEvent.reason
+          ? bilingualServerMessage(closeEvent.reason)
+          : closeEvent.code === 1000
+            ? bilingual('会话已关闭。', 'Session closed.')
+            : bilingual(`会话已关闭（${closeEvent.code}）。`, `Session closed (${closeEvent.code}).`);
       event(reason, 'disconnect', isUnexpected);
       updateConnectionStatus(messageTranslation(reason));
       setState(isUnexpected ? 'error' : 'idle');

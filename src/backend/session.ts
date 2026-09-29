@@ -56,6 +56,21 @@ import {
 } from './network-parser';
 
 type Cipher = SSHAESGCMCipher | SSHAESCTRCipher;
+
+/**
+ * Error for SSH failures that are deterministic with respect to the current
+ * credentials or trust decisions: authentication rejected by the server,
+ * host key declined by the user, or host key signature verification failure.
+ * Retrying with the same parameters can never succeed, so the Durable Object
+ * flags these to the browser with `retryable: false` and close code 4001
+ * instead of the generic transient failure path (close code 1011).
+ */
+export class SSHAuthDefectError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SSHAuthDefectError';
+  }
+}
 type Phase = 'version' | 'kex' | 'host-confirm' | 'auth' | 'pty' | 'shell' | 'ready' | 'closed';
 interface PendingSFTPChannelOpen {
   readonly channelID: number;
@@ -506,12 +521,12 @@ export class SSHSession {
     const keyType = this.decoder.decode(hostKey.subarray(4, 4 + keyTypeLength));
     if (!this.isHostKeyAlgorithmCompatible(this.hostKeyAlgorithm, keyType)) throw new Error(`Server used ${keyType}, but negotiated ${this.hostKeyAlgorithm ?? 'no host key algorithm'}`);
     const fingerprint = `SHA256:${this.base64(new Uint8Array(await crypto.subtle.digest('SHA-256', toBufferSource(hostKey))))}`;
-    if (!await this.verifyHostSignature(hostKey, signature, hash)) throw new Error('SSH host key signature verification failed');
+    if (!await this.verifyHostSignature(hostKey, signature, hash)) throw new SSHAuthDefectError('SSH host key signature verification failed');
     const trust = classifyHostKey(this.config.expectedFingerprint, fingerprint);
     if (trust === 'trusted') {
       this.sendJson({ type: 'host_key', fingerprint, keyType, trusted: true });
     } else if (!await this.confirmHostKey(fingerprint, keyType, trust === 'changed' ? this.config.expectedFingerprint : undefined)) {
-      throw new Error('Host key was not accepted');
+      throw new SSHAuthDefectError('Host key was not accepted');
     }
     this.status('host_key_verified', `Host key verified (${keyType})`);
 
@@ -686,7 +701,7 @@ export class SSHSession {
         return;
       }
       this.config.password = undefined;
-      throw new Error('SSH authentication failed');
+      throw new SSHAuthDefectError('SSH authentication failed');
     }
   }
 

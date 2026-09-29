@@ -25,6 +25,14 @@ export interface ReconnectConfig {
   onConnect: (attempt: number) => WebSocket | Promise<WebSocket>;
   /** Optional callback invoked for every lifecycle event. */
   onLog?: (entry: ReconnectLogEntry) => void;
+  /**
+   * Application-reserved close codes (4000-4999) that indicate a
+   * deterministic failure — retrying with the same parameters can never
+   * succeed (e.g. SSH authentication rejected). When the socket closes with
+   * one of these codes the manager gives up silently instead of scheduling a
+   * reconnection. Codes 1000 and 1005 are always treated this way.
+   */
+  nonRetryableCloseCodes?: number[];
 }
 
 export interface ReconnectLogEntry {
@@ -53,6 +61,7 @@ export class WebSocketReconnectManager {
   private delays: number[];
   private onConnect: (attempt: number) => WebSocket | Promise<WebSocket>;
   private onLog?: (entry: ReconnectLogEntry) => void;
+  private nonRetryableCloseCodes: number[];
   private socket: WebSocket | null = null;
   private destroyed = false;
   private reconnecting = false;
@@ -65,6 +74,7 @@ export class WebSocketReconnectManager {
     this.delays = config.delays?.length ? config.delays : [...DEFAULT_DELAYS];
     this.onConnect = config.onConnect;
     this.onLog = config.onLog;
+    this.nonRetryableCloseCodes = config.nonRetryableCloseCodes ?? [];
   }
 
   /**
@@ -125,6 +135,12 @@ export class WebSocketReconnectManager {
 
     // Normal closures (user-initiated or "no status") should never reconnect.
     if (event.code === 1000 || event.code === 1005) {
+      return;
+    }
+    // Application-reserved codes that mark a deterministic failure (e.g. bad
+    // SSH credentials): retrying cannot succeed, so give up without leaving
+    // any dangling reconnect timer or state.
+    if (this.nonRetryableCloseCodes.includes(event.code)) {
       return;
     }
 

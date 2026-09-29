@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 import { parseConnectMessage, type Env } from '../types';
 import { assertPublicTarget, toSocketHostname } from './security';
 import { createTicket, verifyTicket } from './security';
-import { SSHSession } from './session';
+import { SSHAuthDefectError, SSHSession } from './session';
 
 interface MainAttachment { role: 'main'; phase: 'waiting' | 'connecting' | 'connected' }
 interface SFTPAttachment { role: 'sftp'; phase: 'connected' }
@@ -219,7 +219,11 @@ export class SSHSessionDO implements DurableObject {
       ws.serializeAttachment({ role: 'main', phase: 'connected' } satisfies MainAttachment);
       await ssh.start();
     } catch (error) {
-      this.reject(ws, error instanceof Error ? error.message : String(error));
+      // Deterministic defects (authentication rejected, host key declined or
+      // unverifiable) can never succeed on retry with the same parameters, so
+      // they take the non-retryable path: the browser receives
+      // `retryable: false` and close code 4001 instead of 1011.
+      this.reject(ws, error instanceof Error ? error.message : String(error), !(error instanceof SSHAuthDefectError));
     }
   }
 
@@ -486,10 +490,13 @@ export class SSHSessionDO implements DurableObject {
     throw lastError;
   }
 
-  private reject(ws: WebSocket, message: string): void {
-    try { ws.send(JSON.stringify({ type: 'error', event: 'connection_failed', message })); } catch { /* already closed */ }
+  private reject(ws: WebSocket, message: string, retryable: boolean = true): void {
+    try { ws.send(JSON.stringify({ type: 'error', event: 'connection_failed', message, ...(retryable ? {} : { retryable: false }) })); } catch { /* already closed */ }
     this.cleanup(ws);
-    try { ws.close(1011, 'SSH connection failed'); } catch { /* already closed */ }
+    // 1011: transient failure, the browser may auto-reconnect. 4001 is in the
+    // application-reserved 4000-4999 range and tells the browser the failure
+    // is deterministic (e.g. bad credentials) — do not retry.
+    try { ws.close(retryable ? 1011 : 4001, 'SSH connection failed'); } catch { /* already closed */ }
   }
 
   private clearDeadline(ws: WebSocket): void {
